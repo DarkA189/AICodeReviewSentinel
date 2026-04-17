@@ -59,11 +59,15 @@ Flag when you detect:
 - Invented language features
 - APIs that exist but are used with wrong semantics
 
-## CRITICAL: Output format requirements
+## CRITICAL JSON REQUIREMENTS:
 1. ALL property names MUST have BOTH opening AND closing quotes: "propertyName":
 2. ALL scores and confidence values MUST be numbers (0-100), NOT words
-3. Respond with ONLY valid JSON - no extra text before or after
-4. No trailing commas
+3. ALL code snippets in strings MUST use SINGLE QUOTES or no quotes for strings inside the code
+4. When including code in originalSnippet or fixedSnippet, use single quotes for strings inside the code
+5. Example: "fixedSnippet": "const hash = crypto.createHash('sha256').update(data).digest('hex');"
+6. NO unescaped double quotes inside string values
+7. NO trailing commas before closing braces or brackets
+8. Respond with ONLY valid JSON - no extra text before or after
 
 ## Output Format (copy this structure exactly):
 {
@@ -81,9 +85,9 @@ Flag when you detect:
       "description": "Detailed explanation",
       "lineStart": 1,
       "lineEnd": 5,
-      "originalSnippet": "code",
+      "originalSnippet": "code with single quotes inside",
       "suggestedFix": "explanation",
-      "fixedSnippet": "fixed code",
+      "fixedSnippet": "fixed code with single quotes inside",
       "confidence": 85,
       "owaspCategory": "A01:2021 – Broken Access Control"
     }
@@ -95,7 +99,7 @@ Flag when you detect:
 Valid category values: "security", "correctness", "maintainability", "performance", "hallucination"
 Valid severity values: "critical", "high", "medium", "low", "info"
 
-REMEMBER: Every property name needs BOTH quotes: "propertyName": not propertyName":`;
+IMPORTANT: When including code snippets, ALWAYS use single quotes for strings inside the code, never double quotes!`;
 
 function buildUserPrompt(
   code: string,
@@ -117,7 +121,9 @@ ${semgrepSection}
 
 Provide your complete JSON review now. Be precise with line numbers (1-indexed). Flag ALL issues including subtle AI hallucinations.
 
-CRITICAL: Every property must have BOTH opening and closing quotes: "property": not property":`;
+CRITICAL: 
+- Every property must have BOTH opening and closing quotes: "property": not property":
+- Use single quotes in all code snippets, never double quotes inside strings`;
 }
 
 export async function runLLMReview(
@@ -126,7 +132,7 @@ export async function runLLMReview(
   semgrepFindings: SemgrepFinding[],
   filename?: string
 ): Promise<LLMReviewResponse> {
-  const provider = process.env.LLM_PROVIDER ?? "openai";  // ← NOW DEFAULTS TO OPENAI
+  const provider = process.env.LLM_PROVIDER ?? "openai";
   const userPrompt = buildUserPrompt(code, language, semgrepFindings, filename);
 
   if (provider === "anthropic") {
@@ -171,7 +177,7 @@ async function runOpenAIReview(
   if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
 
   const baseURL = process.env.OPENAI_BASE_URL;
-  const model = process.env.LLM_MODEL ?? "gpt-4o";
+  const model = process.env.LLM_MODEL ?? "llama-3.3-70b-versatile";
 
   const OpenAI = (await import("openai")).default;
   const client = new OpenAI({ 
@@ -197,10 +203,9 @@ async function runOpenAIReview(
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userPrompt },
     ],
-    temperature: 0.1, // Very low for consistent JSON
+    temperature: 0.1,
   };
 
-  // Only add response_format for models that support it
   if (!isFreeModel && !model.includes("openrouter") && !model.includes("llama")) {
     completionParams.response_format = { type: "json_object" };
   }
@@ -219,29 +224,72 @@ async function runOpenAIReview(
   return parseJSONResponse(text);
 }
 
-// SUPER AGGRESSIVE QUOTE FIXER - Handles all missing quote patterns
+// Convert code snippets to use single quotes instead of double quotes
+function fixCodeSnippetsInJSON(json: string): string {
+  // Target code snippet fields specifically
+  return json.replace(/"(originalSnippet|fixedSnippet|suggestedFix|description)":\s*"([^"]*(?:\\"[^"]*)*)"/g, 
+    (match, key, value) => {
+      // Fix the value: convert problematic patterns
+      let fixed = value
+        // Protect already escaped quotes
+        .replace(/\\"/g, '___ESCAPED_QUOTE___')
+        
+        // Convert any remaining double quotes to single quotes
+        .replace(/"/g, "'")
+        
+        // Restore escaped quotes
+        .replace(/___ESCAPED_QUOTE___/g, '\\"');
+      
+      return `"${key}": "${fixed}"`;
+    }
+  );
+}
+
+// Fix all invalid escape sequences in JSON strings
+function fixInvalidEscapes(json: string): string {
+  let fixed = json;
+  
+  // Find all strings and fix escape sequences
+  fixed = fixed.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/g, (match, content, offset) => {
+    const afterMatch = json.substring(offset + match.length, offset + match.length + 5);
+    const isPropertyName = afterMatch.trimStart().startsWith(':');
+    
+    if (isPropertyName) {
+      return match;
+    }
+    
+    let fixedContent = content
+      .replace(/\\"/g, '___ESCAPED_QUOTE___')
+      .replace(/\\\\/g, '___ESCAPED_BACKSLASH___')
+      .replace(/\\n/g, '___ESCAPED_NEWLINE___')
+      .replace(/\\r/g, '___ESCAPED_RETURN___')
+      .replace(/\\t/g, '___ESCAPED_TAB___')
+      .replace(/\\'/g, '___ESCAPED_SINGLE_QUOTE___')
+      .replace(/\\/g, '\\\\')
+      .replace(/___ESCAPED_QUOTE___/g, '\\"')
+      .replace(/___ESCAPED_BACKSLASH___/g, '\\\\')
+      .replace(/___ESCAPED_NEWLINE___/g, '\\n')
+      .replace(/___ESCAPED_RETURN___/g, '\\r')
+      .replace(/___ESCAPED_TAB___/g, '\\t')
+      .replace(/___ESCAPED_SINGLE_QUOTE___/g, "\\'");
+    
+    return `"${fixedContent}"`;
+  });
+  
+  return fixed;
+}
+
+// Fix missing opening quotes on property names
 function fixAllMissingQuotes(json: string): string {
-  // This is the nuclear option - fix EVERY instance of missing opening quotes
-  
-  // Pattern 1: After whitespace + word + ": → "word":
-  // This catches: \s+word": → "word":
   json = json.replace(/(\s+)([a-zA-Z_][a-zA-Z0-9_]*)(":\s*)/g, '$1"$2$3');
-  
-  // Pattern 2: After comma + spaces + word + ": → "word":
   json = json.replace(/(,\s*)([a-zA-Z_][a-zA-Z0-9_]*)(":\s*)/g, '$1"$2$3');
-  
-  // Pattern 3: After opening brace + spaces + word + ": → "word":
   json = json.replace(/(\{\s*)([a-zA-Z_][a-zA-Z0-9_]*)(":\s*)/g, '$1"$2$3');
-  
-  // Pattern 4: At start of line + word + ": → "word":
   json = json.replace(/^(\s*)([a-zA-Z_][a-zA-Z0-9_]*)(":\s*)/gm, '$1"$2$3');
-  
-  // Pattern 5: After ] + spaces + word + ": → "word":
   json = json.replace(/(\]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(":\s*)/g, '$1"$2$3');
-  
   return json;
 }
 
+// Convert text numbers to actual numbers
 function fixNumberWords(json: string): string {
   const numberWords: Record<string, string> = {
     'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
@@ -259,49 +307,6 @@ function fixNumberWords(json: string): string {
   return json;
 }
 
-
-// Fix all invalid escape sequences in JSON strings
-function fixInvalidEscapes(json: string): string {
-  // Step 1: Find all string values (content between quotes)
-  // and fix escape sequences within them
-  return json.replace(/"([^"]*(?:\\"[^"]*)*)"/g, (match, content) => {
-    // Don't touch property names (before colons)
-    if (json.indexOf(match + ':') !== -1 && json.indexOf(match + ':') === json.indexOf(match) + match.length) {
-      return match; // This is a property name, leave it alone
-    }
-    
-    // Fix the content of string values
-    let fixed = content
-      // First, protect valid escape sequences
-      .replace(/\\"/g, '___QUOTE___')
-      .replace(/\\\\/g, '___BACKSLASH___')
-      .replace(/\\\//g, '___SLASH___')
-      .replace(/\\b/g, '___BACKSPACE___')
-      .replace(/\\f/g, '___FORMFEED___')
-      .replace(/\\n/g, '___NEWLINE___')
-      .replace(/\\r/g, '___RETURN___')
-      .replace(/\\t/g, '___TAB___')
-      .replace(/\\u([0-9a-fA-F]{4})/g, '___UNICODE_$1___')
-      
-      // Remove any remaining backslashes (they're invalid)
-      .replace(/\\/g, '')
-      
-      // Restore valid escape sequences
-      .replace(/___QUOTE___/g, '\\"')
-      .replace(/___BACKSLASH___/g, '\\\\')
-      .replace(/___SLASH___/g, '\\/')
-      .replace(/___BACKSPACE___/g, '\\b')
-      .replace(/___FORMFEED___/g, '\\f')
-      .replace(/___NEWLINE___/g, '\\n')
-      .replace(/___RETURN___/g, '\\r')
-      .replace(/___TAB___/g, '\\t')
-      .replace(/___UNICODE_([0-9a-fA-F]{4})___/g, '\\u$1');
-    
-    return `"${fixed}"`;
-  });
-}
-
-
 function parseJSONResponse(text: string): LLMReviewResponse {
   let cleaned = text
     .replace(/^```(?:json)?\n?/m, "")
@@ -313,14 +318,20 @@ function parseJSONResponse(text: string): LLMReviewResponse {
     cleaned = jsonMatch[0];
   }
 
-  // CRITICAL: Fix invalid escapes FIRST
-  console.log('[JSON] Fixing invalid escape sequences...');
+  // Apply fixes in order
+  console.log('[JSON] Step 1: Fixing code snippets...');
+  cleaned = fixCodeSnippetsInJSON(cleaned);
+
+  console.log('[JSON] Step 2: Fixing invalid escape sequences...');
   cleaned = fixInvalidEscapes(cleaned);
 
-  console.log('[JSON] Fixing missing quotes...');
+  console.log('[JSON] Step 3: Fixing missing quotes...');
   cleaned = fixAllMissingQuotes(cleaned);
 
+  console.log('[JSON] Step 4: Fixing number words...');
   cleaned = fixNumberWords(cleaned);
+
+  console.log('[JSON] Step 5: Removing trailing commas...');
   cleaned = cleaned.replace(/,(\s*[}\]])/g, '$1');
 
   try {
@@ -330,16 +341,24 @@ function parseJSONResponse(text: string): LLMReviewResponse {
   } catch (error) {
     console.error(`[JSON] ✗ Parse failed`);
     console.error(`[JSON] Error: ${error instanceof Error ? error.message : 'unknown'}`);
-    console.error(`[JSON] Position 2172 context:\n${cleaned.slice(2150, 2200)}`);
+    
+    // Find the error position if available
+    const errorMsg = error instanceof Error ? error.message : '';
+    const posMatch = errorMsg.match(/position (\d+)/);
+    if (posMatch) {
+      const pos = parseInt(posMatch[1]);
+      console.error(`[JSON] Context around position ${pos}:`);
+      console.error(cleaned.slice(Math.max(0, pos - 50), pos + 50));
+    }
     
     throw new Error(
       `❌ Failed to parse LLM JSON response.\n\n` +
       `Error: ${error instanceof Error ? error.message : 'Unknown'}\n\n` +
-      `Character at issue: "${cleaned.charAt(2172)}"\n` +
-      `Context: ${cleaned.slice(2170, 2180)}`
+      `This usually means the model included improperly escaped code snippets.`
     );
   }
 }
+
 const VALID_CATEGORIES: IssueCategory[] = [
   "security",
   "correctness",
