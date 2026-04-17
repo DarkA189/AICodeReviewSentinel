@@ -126,7 +126,7 @@ export async function runLLMReview(
   semgrepFindings: SemgrepFinding[],
   filename?: string
 ): Promise<LLMReviewResponse> {
-  const provider = process.env.LLM_PROVIDER ?? "anthropic";
+  const provider = process.env.LLM_PROVIDER ?? "openai";  // ← NOW DEFAULTS TO OPENAI
   const userPrompt = buildUserPrompt(code, language, semgrepFindings, filename);
 
   if (provider === "anthropic") {
