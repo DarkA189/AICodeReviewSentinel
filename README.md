@@ -15,7 +15,7 @@ A Next.js-powered code analysis tool that combines static analysis with LLM-base
 
 ## 🚀 Live Demo
 
-**[Try it now →](https://ai-code-review-sentinel.vercel.app)**
+**[Try it now →](https://aicodereviewsentinel-deployed.vercel.app/)**
 
 ## 🏗️ Tech Stack
 
